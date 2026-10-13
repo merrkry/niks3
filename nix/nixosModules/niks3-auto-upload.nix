@@ -2,11 +2,14 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 
 let
   cfg = config.services.niks3-auto-upload;
+  # Existing mTLS-only configurations may use an empty token file path.
+  hasAuthTokenFile = cfg.authTokenFile != null && cfg.authTokenFile != "";
   hookPackage = cfg.package.override { postBuildHookSocketPath = cfg.socketPath; };
   # Nix post-build-hook must be a single executable; wrap the subcommand invocation.
   postBuildHookScript = pkgs.writeShellScript "niks3-post-build-hook" ''
@@ -31,13 +34,29 @@ in
     };
 
     authTokenFile = lib.mkOption {
-      type = lib.types.str;
+      type = lib.types.nullOr lib.types.str;
+      default = null;
       description = ''
         Path to a file containing the auth token.
         The file should contain only the token without trailing newlines.
         Use a runtime path (e.g. from sops-nix or agenix), not a Nix store path.
+        Mutually exclusive with authTokenScript. May be unset when using mTLS.
       '';
       example = "/run/secrets/niks3-auth-token";
+    };
+
+    authTokenScript = lib.mkOption {
+      type = lib.types.nullOr lib.types.nonEmptyStr;
+      default = null;
+      description = ''
+        Command that prints {"token":"...","expires_at":"RFC3339"} to stdout.
+        expires_at is optional. The client caches the token and refreshes before
+        expiry when expires_at is present.
+        Arguments support shell-style quoting, without shell expansion.
+        Use absolute executable paths and keep secrets outside the Nix store.
+        Mutually exclusive with authTokenFile. May be unset when using mTLS.
+      '';
+      example = "/run/secrets/niks3-token-command --audience https://cache.example.com";
     };
 
     socketPath = lib.mkOption {
@@ -107,6 +126,17 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !(hasAuthTokenFile && cfg.authTokenScript != null);
+        message = "services.niks3-auto-upload.authTokenFile and authTokenScript are mutually exclusive";
+      }
+      {
+        assertion = hasAuthTokenFile || cfg.authTokenScript != null || cfg.mtls.enable;
+        message = "services.niks3-auto-upload requires authTokenFile, authTokenScript, or mtls.enable";
+      }
+    ];
+
     nix.settings.post-build-hook = toString postBuildHookScript;
 
     systemd.sockets.niks3-auto-upload = {
@@ -134,16 +164,14 @@ in
           let
             idleStr = if cfg.idleExitTimeout == 0 then "0" else "${toString cfg.idleExitTimeout}s";
           in
-          lib.concatStringsSep " " (
+          utils.escapeSystemdExecArgs (
             [
               (lib.getExe' cfg.package "niks3-hook")
               "serve"
               "--server-url"
-              (lib.escapeShellArg cfg.serverUrl)
-              "--auth-token-path"
-              (lib.escapeShellArg cfg.authTokenFile)
+              cfg.serverUrl
               "--socket"
-              (lib.escapeShellArg cfg.socketPath)
+              cfg.socketPath
               "--batch-size"
               (toString cfg.batchSize)
               "--idle-exit-timeout"
@@ -153,17 +181,25 @@ in
               "--db-path"
               "/var/lib/niks3-hook/upload-queue.db"
             ]
+            ++ lib.optionals hasAuthTokenFile [
+              "--auth-token-path"
+              cfg.authTokenFile
+            ]
+            ++ lib.optionals (cfg.authTokenScript != null) [
+              "--auth-token-script"
+              cfg.authTokenScript
+            ]
             ++ lib.optional cfg.verifyS3Integrity "--verify-s3-integrity"
             ++ lib.optional cfg.debug "--debug"
             ++ lib.optionals cfg.mtls.enable [
               "--client-cert"
-              (lib.escapeShellArg cfg.mtls.clientCert)
+              cfg.mtls.clientCert
               "--client-key"
-              (lib.escapeShellArg cfg.mtls.clientKey)
+              cfg.mtls.clientKey
             ]
             ++ lib.optionals (cfg.mtls.enable && cfg.mtls.caCert != null) [
               "--ca-cert"
-              (lib.escapeShellArg cfg.mtls.caCert)
+              cfg.mtls.caCert
             ]
           );
         Restart = "on-failure";

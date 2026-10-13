@@ -88,6 +88,9 @@ packages
       '';
 }
 // lib.optionalAttrs (lib.hasSuffix "linux" system) {
+  nixos-auto-upload-module = pkgs.callPackage ./nixos-auto-upload-module.nix {
+    niks3-hook = selfPackages.niks3-hook;
+  };
   nixos-test-niks3 = pkgs.callPackage ./nixos-test-niks3.nix {
     inherit common;
     mock-oidc-server = selfPackages.mock-oidc-server;
